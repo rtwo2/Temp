@@ -30,14 +30,10 @@ namespace ProxyCollector.Collector
         };
 
         // ====================== CLOUDFLARE / CDN CIDR FILTER ======================
-        private static readonly string[] CdnIpPrefixes =
-        {
-            "162.159.", "104.16.", "104.17.", "104.18.", "104.19.", "104.20.", "104.21.",
-            "172.64.", "172.65.", "172.66.", "172.67.", "172.68.", "172.69.", "172.70.",
-            "172.71.", "173.245.", "108.162.", "190.93.", "188.114.", "197.234.", "198.41.",
-            "1.1.1.", "1.0.0.", "162.158.", "3.33.", "15.197.",
-        };
-
+        // (String-prefix matching used to live here, e.g. "104.16." — but that also
+        //  matches 104.160.x.x-104.169.x.x, which is NOT Cloudflare. That false-positive
+        //  was quietly dropping a lot of legitimate nodes. Precise CIDR matching below
+        //  is now the only IP-range based filter.)
         private static readonly HashSet<string> CdnIpExact = new()
         {
             "1.1.1.1", "1.0.0.1", "8.8.8.8", "8.8.4.4",
@@ -182,8 +178,6 @@ namespace ProxyCollector.Collector
             {"VU","Oceania"},{"WF","Oceania"},{"WS","Oceania"},
         };
 
-        private static readonly List<(IPAddress Network, int Mask)> BlacklistCidrs = new();
-
         // ====================== LOGGING ======================
         private static void Log(string msg, ConsoleColor color = ConsoleColor.White)
         { Console.ForegroundColor = color; Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] {msg}"); Console.ResetColor(); }
@@ -232,64 +226,6 @@ namespace ProxyCollector.Collector
             }
         }
 
-        // ====================== BLACKLIST ======================
-        private static async Task DownloadFreshFireHOLBlacklist(HttpClient http)
-        {
-            LogInfo("Downloading FireHOL blacklist...");
-            try
-            {
-                var resp = await http.GetAsync("https://iplists.firehol.org/files/firehol_level1.netset");
-                resp.EnsureSuccessStatusCode();
-                await using var fs = new FileStream("ProxyCollector/blacklist.netset", FileMode.Create);
-                await resp.Content.CopyToAsync(fs);
-                LogSuccess("FireHOL downloaded.");
-            }
-            catch (Exception ex) { LogWarning($"FireHOL failed: {ex.Message}"); }
-        }
-
-        private static void LoadAllBlacklists()
-        {
-            BlacklistCidrs.Clear();
-            var path = "ProxyCollector/blacklist.netset";
-            if (!File.Exists(path)) return;
-            int loaded = 0;
-            foreach (var line in File.ReadAllLines(path))
-            {
-                if (line.StartsWith("#") || string.IsNullOrWhiteSpace(line)) continue;
-                try
-                {
-                    var p = line.Split('/');
-                    if (p.Length == 2)
-                    { BlacklistCidrs.Add((IPAddress.Parse(p[0].Trim()), int.Parse(p[1].Trim()))); loaded++; }
-                }
-                catch { }
-            }
-            LogInfo($"Loaded {loaded} FireHOL CIDRs.");
-        }
-
-        private static bool IsFireholBlacklisted(string ipStr)
-        {
-            if (!IPAddress.TryParse(ipStr, out var ip)) return false;
-            foreach (var (net, mask) in BlacklistCidrs)
-                if (IsIpInCidr(ip, net, mask)) return true;
-            return false;
-        }
-
-        private static bool IsIpInCidr(IPAddress ip, IPAddress net, int mask)
-        {
-            byte[] a = ip.GetAddressBytes(), b = net.GetAddressBytes();
-            if (a.Length != b.Length) return false;
-            int bits = mask;
-            for (int i = 0; i < a.Length && bits > 0; i++)
-            {
-                int s = Math.Min(bits, 8);
-                byte m = (byte)(0xFF << (8 - s));
-                if ((a[i] & m) != (b[i] & m)) return false;
-                bits -= s;
-            }
-            return true;
-        }
-
         // ====================== HOST FILTERING ======================
         private static bool IsBadHost(string host)
         {
@@ -301,58 +237,66 @@ namespace ProxyCollector.Collector
 
             if (IPAddress.TryParse(host, out _))
             {
-                foreach (var prefix in CdnIpPrefixes)
-                    if (host.StartsWith(prefix)) return true;
                 if (IsCloudflareIp(host)) return true;
-                if (IsFireholBlacklisted(host)) return true;
             }
 
             return false;
         }
 
         // ====================== LOCATION ======================
+        // Fallback chain: city-on-host -> country-on-host -> (if hostname) resolve DNS,
+        // then city-on-resolved-ip -> country-on-resolved-ip -> Unknown.
+        // Doing the city lookup on the resolved IP too (not just country, as before)
+        // means hostname-based nodes get the same city-level precision as IP-based ones.
         private string GetLocation(string host)
         {
             try
             {
-                var city = Resolver.GetCity(host);
-                if (!string.IsNullOrEmpty(city?.CityName))
-                {
-                    string flag = Flags.TryGetValue(city.CountryCode?.ToUpper() ?? "", out var f) ? f : "🌍";
-                    return $"{flag} {city.CityName}, {city.CountryCode?.ToUpper()}";
-                }
-                var country = Resolver.GetCountry(host);
-                string cc = country?.CountryCode?.ToUpper() ?? "";
-                if (!string.IsNullOrEmpty(cc) && cc != "XX")
-                {
-                    string flagC = Flags.TryGetValue(cc, out var fc) ? fc : "🌍";
-                    string name = !string.IsNullOrEmpty(country?.CountryName) && country.CountryName != "Unknown"
-                        ? country.CountryName : cc;
-                    return $"{flagC} {name}";
-                }
+                string? result = TryCityThenCountry(host);
+                if (result != null) return result;
+
                 if (!IPAddress.TryParse(host, out _))
                 {
                     try
                     {
                         var addrs = Dns.GetHostAddresses(host);
-                        if (addrs.Length > 0)
+                        foreach (var addr in addrs)
                         {
-                            var c2 = Resolver.GetCountry(addrs[0].ToString());
-                            string cc2 = c2?.CountryCode?.ToUpper() ?? "";
-                            if (!string.IsNullOrEmpty(cc2) && cc2 != "XX")
-                            {
-                                string f2 = Flags.TryGetValue(cc2, out var ff2) ? ff2 : "🌍";
-                                string n2 = !string.IsNullOrEmpty(c2?.CountryName) && c2.CountryName != "Unknown"
-                                    ? c2.CountryName : cc2;
-                                return $"{f2} {n2}";
-                            }
+                            result = TryCityThenCountry(addr.ToString());
+                            if (result != null) return result;
                         }
                     }
                     catch { }
                 }
+
                 return "🌐 Unknown";
             }
             catch { return "🌐 Unknown"; }
+        }
+
+        private string? TryCityThenCountry(string ipOrHost)
+        {
+            var city = Resolver.GetCity(ipOrHost);
+            if (!string.IsNullOrEmpty(city?.CityName))
+            {
+                string cityCc = city.CountryCode?.ToUpper() ?? "";
+                string flag = Flags.TryGetValue(cityCc, out var f) ? f : "🌍";
+                string cityName = System.Globalization.CultureInfo.InvariantCulture.TextInfo
+                    .ToTitleCase(city.CityName.Trim().ToLowerInvariant());
+                return $"{flag} {cityName}, {cityCc}";
+            }
+
+            var country = Resolver.GetCountry(ipOrHost);
+            string cc = country?.CountryCode?.ToUpper() ?? "";
+            if (!string.IsNullOrEmpty(cc) && cc != "XX")
+            {
+                string flagC = Flags.TryGetValue(cc, out var fc) ? fc : "🌍";
+                string name = !string.IsNullOrEmpty(country?.CountryName) && country.CountryName != "Unknown"
+                    ? country.CountryName : cc;
+                return $"{flagC} {name}";
+            }
+
+            return null;
         }
 
         private static string GetContinent(string cc)
@@ -417,8 +361,6 @@ namespace ProxyCollector.Collector
         public async Task StartAsync()
         {
             await DownloadGeoIPDatabases(_http);
-            await DownloadFreshFireHOLBlacklist(_http);
-            LoadAllBlacklists();
             LogSuccess("🚀 FastNodes v5.7 - Starting collection...");
             await RunFullCollectionMode();
         }
@@ -473,7 +415,7 @@ namespace ProxyCollector.Collector
                 }
             }
 
-            LogInfo($"After smart dedup: {uniqueProxies.Count} unique ({cfFiltered} CDN/blacklist filtered)");
+            LogInfo($"After smart dedup: {uniqueProxies.Count} unique ({cfFiltered} CDN filtered)");
 
             // STEP 3: TCP alive check
             LogInfo("🔌 TCP alive check (parallel)...");
@@ -519,11 +461,13 @@ namespace ProxyCollector.Collector
             var finalProxies = new List<FinalProxy>();
 
             // Pass 1: count total occurrences of each base remark using frozen locations
+            // NOTE: remark no longer contains the server address/port — just geo + protocol —
+            // so uniqueness is purely location+protocol based now.
             var remarkTotal = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
             foreach (var item in alive)
             {
                 var p = item.Proxy;
-                string baseRemark = $"{Loc(p.Host)} | {NormalizeProto(p.Protocol).ToUpperInvariant()} | {p.Host}:{p.Port}";
+                string baseRemark = $"{Loc(p.Host)} | {NormalizeProto(p.Protocol).ToUpperInvariant()}";
                 remarkTotal.TryGetValue(baseRemark, out int cnt);
                 remarkTotal[baseRemark] = cnt + 1;
             }
@@ -534,7 +478,7 @@ namespace ProxyCollector.Collector
             {
                 var p = item.Proxy;
                 string proto = NormalizeProto(p.Protocol);
-                string baseRemark = $"{Loc(p.Host)} | {proto.ToUpperInvariant()} | {p.Host}:{p.Port}";
+                string baseRemark = $"{Loc(p.Host)} | {proto.ToUpperInvariant()}";
 
                 remarkCounter.TryGetValue(baseRemark, out int current);
                 remarkCounter[baseRemark] = current + 1;
@@ -549,13 +493,11 @@ namespace ProxyCollector.Collector
                 string cleanLink = BuildCleanLink(p, remark);
                 string cc = Resolver.GetCountry(p.Host)?.CountryCode?.ToUpper() ?? "XX";
                 string continent = GetContinent(cc);
-                var clashProxy = BuildClashProxyDict(p, remark);
 
                 finalProxies.Add(new FinalProxy
                 {
                     Link = cleanLink, Proto = proto, CountryCode = cc,
                     Continent = continent, Remark = remark,
-                    ClashProxyDict = clashProxy,
                     Latency = item.Latency, QualityScore = p.QualityScore
                 });
             }
@@ -602,120 +544,6 @@ namespace ProxyCollector.Collector
             }
             catch { }
             return p.BaseLink.TrimEnd() + "#" + encoded;
-        }
-
-        // ====================== BUILD CLASH PROXY DICT ======================
-        // Returns a Dictionary<string,object> suitable for direct YAML serialization
-        private static Dictionary<string, object?>? BuildClashProxyDict(ParsedProxy p, string name)
-        {
-            try
-            {
-                string proto = NormalizeProto(p.Protocol);
-                int port = int.TryParse(p.Port, out int pp) ? pp : 443;
-
-                switch (proto)
-                {
-                    case "vless":
-                    {
-                        var d = new Dictionary<string, object?>
-                        {
-                            ["name"]             = name,
-                            ["type"]             = "vless",
-                            ["server"]           = p.Host,
-                            ["port"]             = port,
-                            ["uuid"]             = p.Credential,
-                            ["tls"]              = p.Security is "tls" or "reality",
-                            ["network"]          = string.IsNullOrEmpty(p.Network) ? "tcp" : p.Network,
-                            ["skip-cert-verify"] = true,
-                        };
-                        if (!string.IsNullOrEmpty(p.Sni)) d["servername"] = p.Sni;
-                        if (p.Security == "reality")      d["reality-opts"] = new Dictionary<string, object?> { ["public-key"] = "" };
-                        if (!string.IsNullOrEmpty(p.Path) && p.Network == "ws")
-                            d["ws-opts"] = new Dictionary<string, object?> { ["path"] = p.Path };
-                        if (!string.IsNullOrEmpty(p.Path) && p.Network == "grpc")
-                            d["grpc-opts"] = new Dictionary<string, object?> { ["grpc-service-name"] = p.Path };
-                        return d;
-                    }
-                    case "trojan":
-                    {
-                        var d = new Dictionary<string, object?>
-                        {
-                            ["name"]             = name,
-                            ["type"]             = "trojan",
-                            ["server"]           = p.Host,
-                            ["port"]             = port,
-                            ["password"]         = p.Credential,
-                            ["skip-cert-verify"] = true,
-                        };
-                        if (!string.IsNullOrEmpty(p.Sni)) d["sni"] = p.Sni;
-                        if (!string.IsNullOrEmpty(p.Network) && p.Network != "tcp")
-                            d["network"] = p.Network;
-                        if (!string.IsNullOrEmpty(p.Path) && p.Network == "ws")
-                            d["ws-opts"] = new Dictionary<string, object?> { ["path"] = p.Path };
-                        if (!string.IsNullOrEmpty(p.Path) && p.Network == "grpc")
-                            d["grpc-opts"] = new Dictionary<string, object?> { ["grpc-service-name"] = p.Path };
-                        return d;
-                    }
-                    case "ss":
-                    {
-                        string method = "", password = "";
-                        string ui = p.Credential;
-                        try
-                        {
-                            int pd = ui.Length % 4; if (pd > 0) ui += new string('=', 4 - pd);
-                            var dec = Encoding.UTF8.GetString(Convert.FromBase64String(ui));
-                            int c = dec.IndexOf(':');
-                            if (c > 0) { method = dec[..c]; password = dec[(c + 1)..]; }
-                        }
-                        catch
-                        {
-                            int c = ui.IndexOf(':');
-                            if (c > 0) { method = ui[..c]; password = ui[(c + 1)..]; }
-                        }
-                        return new Dictionary<string, object?>
-                        {
-                            ["name"] = name, ["type"] = "ss",
-                            ["server"] = p.Host, ["port"] = port,
-                            ["cipher"] = method, ["password"] = password
-                        };
-                    }
-                    case "hysteria2":
-                        return new Dictionary<string, object?>
-                        {
-                            ["name"]             = name,
-                            ["type"]             = "hysteria2",
-                            ["server"]           = p.Host,
-                            ["port"]             = port,
-                            ["password"]         = p.Credential,
-                            ["sni"]              = string.IsNullOrEmpty(p.Sni) ? p.Host : p.Sni,
-                            ["skip-cert-verify"] = true,
-                        };
-                    case "vmess":
-                    {
-                        var d = new Dictionary<string, object?>
-                        {
-                            ["name"]             = name,
-                            ["type"]             = "vmess",
-                            ["server"]           = p.Host,
-                            ["port"]             = port,
-                            ["uuid"]             = p.Credential,
-                            ["alterId"]          = p.Aid,
-                            ["cipher"]           = "auto",
-                            ["network"]          = string.IsNullOrEmpty(p.Network) ? "tcp" : p.Network,
-                            ["tls"]              = p.Security == "tls",
-                            ["skip-cert-verify"] = true,
-                        };
-                        if (!string.IsNullOrEmpty(p.Sni)) d["servername"] = p.Sni;
-                        if (!string.IsNullOrEmpty(p.Path) && p.Network == "ws")
-                            d["ws-opts"] = new Dictionary<string, object?> { ["path"] = p.Path };
-                        if (!string.IsNullOrEmpty(p.Path) && p.Network == "grpc")
-                            d["grpc-opts"] = new Dictionary<string, object?> { ["grpc-service-name"] = p.Path };
-                        return d;
-                    }
-                    default: return null;
-                }
-            }
-            catch { return null; }
         }
 
         // ====================== SOURCE DECODING ======================
@@ -793,22 +621,26 @@ namespace ProxyCollector.Collector
         }
 
         // ====================== SAVE OUTPUTS ======================
+        // Raw output only (no yaml/json) — every category gets two files:
+        //   <name>.txt          full list
+        //   <name>.top1000.txt  best 1000 nodes (already quality+latency sorted upstream)
+        private const int TopCap = 1000;
+
         private async Task SaveAllCategories(List<FinalProxy> proxies)
         {
             var sub = Path.Combine(Directory.GetCurrentDirectory(), "sub");
             foreach (var d in new[] { "protocols", "countries", "continents" })
                 Directory.CreateDirectory(Path.Combine(sub, d));
 
-            // everything.txt — full list, no cap, no YAML (too large)
-            await File.WriteAllLinesAsync(Path.Combine(sub, "everything.txt"), proxies.Select(x => x.Link));
-            LogSuccess($"Saved everything.txt ({proxies.Count})");
+            await WriteTxt(Path.Combine(sub, "everything"), proxies);
+            LogSuccess($"Saved everything.txt / everything.top1000.txt ({proxies.Count})");
 
             foreach (var g in proxies.GroupBy(x => x.Proto))
             {
                 string key = g.Key.Trim().ToLowerInvariant();
                 if (string.IsNullOrEmpty(key) || key == "unknown") continue;
 
-                await WriteTxtAndYaml(Path.Combine(sub, "protocols", key), g.ToList());
+                await WriteTxt(Path.Combine(sub, "protocols", key), g.ToList());
                 LogSuccess($"  → protocols/{key} ({g.Count()})");
             }
 
@@ -817,126 +649,28 @@ namespace ProxyCollector.Collector
                 if (string.IsNullOrEmpty(g.Key) || g.Key == "XX" || g.Count() < 3) continue;
                 string safe = Regex.Replace(g.Key, @"[^A-Z0-9]", "");
                 if (string.IsNullOrEmpty(safe)) continue;
-                await WriteTxtAndYaml(Path.Combine(sub, "countries", safe), g.ToList());
+                await WriteTxt(Path.Combine(sub, "countries", safe), g.ToList());
                 LogSuccess($"  → countries/{safe} ({g.Count()})");
             }
 
             foreach (var g in proxies.GroupBy(x => x.Continent))
             {
                 if (g.Key == "Unknown" || g.Count() < 3) continue;
-                await WriteTxtAndYaml(Path.Combine(sub, "continents", g.Key), g.ToList());
+                await WriteTxt(Path.Combine(sub, "continents", g.Key), g.ToList());
                 LogSuccess($"  → continents/{g.Key} ({g.Count()})");
             }
         }
 
-        // ====================== WRITE TXT + YAML ======================
-        // .txt  → full list, plain URI format, one per line
-        // .yaml → Clash/Mihomo/FlClash compatible, capped at 1000 best nodes
-        private static async Task WriteTxtAndYaml(string pathNoExt, List<FinalProxy> proxies)
+        // ====================== WRITE TXT (+ TOP1000) ======================
+        private static async Task WriteTxt(string pathNoExt, List<FinalProxy> proxies)
         {
             // Full plain-text URI list
             await File.WriteAllLinesAsync(pathNoExt + ".txt", proxies.Select(x => x.Link));
 
-            // Clash YAML — best 1000 only
-            const int YamlCap = 1000;
-            var subset = proxies.Count > YamlCap ? proxies.Take(YamlCap).ToList() : proxies;
-
-            var validProxies = subset
-                .Select(x => x.ClashProxyDict)
-                .Where(d => d != null)
-                .ToList();
-
-            var names = subset
-                .Where(x => x.ClashProxyDict != null)
-                .Select(x => x.Remark)
-                .ToList();
-
-            string categoryName = Path.GetFileName(pathNoExt);
-            var yaml = new StringBuilder();
-
-            // Clash/Mihomo YAML header
-            yaml.AppendLine($"# FastNodes — {categoryName}");
-            yaml.AppendLine($"# Generated: {DateTime.UtcNow:yyyy-MM-dd HH:mm} UTC");
-            yaml.AppendLine($"# Proxies: {validProxies.Count} (capped at {YamlCap} best quality)");
-            yaml.AppendLine($"# Compatible: Clash Meta / Mihomo / FlClash / FlClashX");
-            yaml.AppendLine();
-            yaml.AppendLine("mixed-port: 7890");
-            yaml.AppendLine("allow-lan: true");
-            yaml.AppendLine("mode: rule");
-            yaml.AppendLine("log-level: info");
-            yaml.AppendLine("external-controller: 127.0.0.1:9090");
-            yaml.AppendLine("dns:");
-            yaml.AppendLine("  enable: true");
-            yaml.AppendLine("  enhanced-mode: fake-ip");
-            yaml.AppendLine("  nameserver:");
-            yaml.AppendLine("    - 8.8.8.8");
-            yaml.AppendLine("    - 1.1.1.1");
-            yaml.AppendLine();
-            yaml.AppendLine("proxies:");
-
-            foreach (var proxy in validProxies!)
-                AppendClashProxyYaml(yaml, proxy!);
-
-            yaml.AppendLine();
-            yaml.AppendLine("proxy-groups:");
-            yaml.AppendLine($"  - name: \"{categoryName}\"");
-            yaml.AppendLine("    type: url-test");
-            yaml.AppendLine("    url: http://cp.cloudflare.com/generate_204");
-            yaml.AppendLine("    interval: 300");
-            yaml.AppendLine("    tolerance: 50");
-            yaml.AppendLine("    proxies:");
-            foreach (var name in names)
-                yaml.AppendLine($"      - \"{EscapeYamlString(name)}\"");
-
-            yaml.AppendLine($"  - name: \"AUTO\"");
-            yaml.AppendLine("    type: select");
-            yaml.AppendLine("    proxies:");
-            foreach (var name in names)
-                yaml.AppendLine($"      - \"{EscapeYamlString(name)}\"");
-
-            yaml.AppendLine();
-            yaml.AppendLine("rules:");
-            yaml.AppendLine("  - MATCH,AUTO");
-
-            await File.WriteAllTextAsync(pathNoExt + ".yaml", yaml.ToString());
+            // Best 1000 only — proxies is already ordered by QualityScore desc, then latency asc
+            var top = proxies.Count > TopCap ? proxies.Take(TopCap) : proxies;
+            await File.WriteAllLinesAsync(pathNoExt + ".top1000.txt", top.Select(x => x.Link));
         }
-
-        // ====================== YAML PROXY SERIALIZER ======================
-        private static void AppendClashProxyYaml(StringBuilder sb, Dictionary<string, object?> proxy)
-        {
-            sb.AppendLine("  - " + YamlKeyValue("name", proxy.GetValueOrDefault("name")));
-
-            foreach (var kv in proxy)
-            {
-                if (kv.Key == "name") continue;
-
-                if (kv.Value is Dictionary<string, object?> nested)
-                {
-                    sb.AppendLine($"    {kv.Key}:");
-                    foreach (var nkv in nested)
-                        sb.AppendLine("      " + YamlKeyValue(nkv.Key, nkv.Value));
-                }
-                else
-                {
-                    sb.AppendLine("    " + YamlKeyValue(kv.Key, kv.Value));
-                }
-            }
-        }
-
-        private static string YamlKeyValue(string key, object? value)
-        {
-            return value switch
-            {
-                null          => $"{key}: ~",
-                bool b        => $"{key}: {(b ? "true" : "false")}",
-                int i         => $"{key}: {i}",
-                string s      => $"{key}: \"{EscapeYamlString(s)}\"",
-                _             => $"{key}: \"{EscapeYamlString(value.ToString() ?? "")}\"",
-            };
-        }
-
-        private static string EscapeYamlString(string s)
-            => s.Replace("\\", "\\\\").Replace("\"", "\\\"").Replace("\n", "\\n").Replace("\r", "\\r");
 
         // ====================== PARSE ======================
         private static ParsedProxy? ParseProxyLine(string line)
@@ -1073,7 +807,6 @@ namespace ProxyCollector.Collector
         public string  CountryCode      { get; set; } = "XX";
         public string  Continent        { get; set; } = "Unknown";
         public string  Remark           { get; set; } = "";
-        public Dictionary<string, object?>? ClashProxyDict { get; set; }
         public int     Latency          { get; set; }
         public int     QualityScore     { get; set; }
     }
