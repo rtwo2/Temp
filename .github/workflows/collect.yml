@@ -208,6 +208,34 @@ jobs:
             https://raw.githubusercontent.com/sakha1370/OpenRay/refs/heads/main/output/all_valid_proxies.txt
             https://raw.githubusercontent.com/yitong2333/proxy-minging/refs/heads/main/v2ray.txt
             https://raw.githubusercontent.com/acymz/AutoVPN/refs/heads/main/data/V2.txt
+            # === NEW SOURCES (added Aug 2026, cross-checked live against NiREvil/vless's hourly-updated source list) ===
+            https://raw.githubusercontent.com/mahdibland/ShadowsocksAggregator/master/Eternity
+            https://raw.githubusercontent.com/mahdibland/ShadowsocksAggregator/master/sub/splitted/trojan.txt
+            https://raw.githubusercontent.com/4n0nymou3/multi-proxy-config-fetcher/refs/heads/main/configs/proxy_configs.txt
+            https://raw.githubusercontent.com/Mosifree/-FREE2CONFIG/refs/heads/main/Vless
+            https://raw.githubusercontent.com/Mosifree/-FREE2CONFIG/refs/heads/main/Reality
+            https://raw.githubusercontent.com/Mosifree/-FREE2CONFIG/refs/heads/main/Clash_Movaghat
+            https://raw.githubusercontent.com/sakha1370/OpenRay/refs/heads/main/output_iran/iran_top100_checked.txt
+            https://raw.githubusercontent.com/Argh94/Proxy-List/refs/heads/main/All_Config.txt
+            https://raw.githubusercontent.com/F0rc3Run/F0rc3Run/refs/heads/main/Best-Results/sub.txt
+            https://raw.githubusercontent.com/itsyebekhe/PSG/main/subscriptions/xray/normal/vmess
+            https://raw.githubusercontent.com/itsyebekhe/PSG/main/lite/subscriptions/xray/normal/hy2
+            https://raw.githubusercontent.com/AzadNetCH/Clash/refs/heads/main/AzadNet_iOS.txt
+            https://raw.githubusercontent.com/bamdad23/JavidnamanIran/refs/heads/main/WS%2BHysteria2
+            https://raw.githubusercontent.com/JavidnamanIran-at-Telegram/x-ray_sub/refs/heads/main/x-ray_sub.txt
+            https://raw.githubusercontent.com/ndsphonemy/proxy-sub/refs/heads/main/speed.txt
+            https://raw.githubusercontent.com/ndsphonemy/proxy-sub/refs/heads/main/hys-tuic.txt
+            https://raw.githubusercontent.com/mshojaei77/v2rayAuto/refs/heads/main/subs/hysteria
+            https://raw.githubusercontent.com/mshojaei77/v2rayAuto/refs/heads/main/subs/hy2
+            https://raw.githubusercontent.com/iboxz/free-v2ray-collector/main/main/mix.txt
+            https://raw.githubusercontent.com/CidVpn/cid-vpn-config/refs/heads/main/general.txt
+            https://raw.githubusercontent.com/teknovpnhub/v2ray-subscription/refs/heads/main/servers.txt
+            https://raw.githubusercontent.com/therealaleph/Iran-configs/refs/heads/main/ir_configs.txt
+            https://raw.githubusercontent.com/hamedp-71/Sub_Checker_Creator/refs/heads/main/final.txt
+            https://raw.githubusercontent.com/V2RAYCONFIGSPOOL/V2RAY_SUB/refs/heads/main/v2ray_configs.txt
+            https://raw.githubusercontent.com/awesome-vpn/awesome-vpn/master/all
+            https://raw.githubusercontent.com/shabane/kamaji/master/hub/merged.txt
+            https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/BLACK_SS%2BAll_RUS.txt
           DOTNET_ROOT: /usr/share/dotnet
 
       - name: Commit & Push
@@ -216,11 +244,11 @@ jobs:
           git config --global user.email "actions@github.com"
 
           git add sub/everything.txt \
+                  sub/everything.top1000.txt \
                   sub/protocols/ \
                   sub/countries/ \
                   sub/continents/ \
-                  ProxyCollector/GeoLite2-Country.mmdb \
-                  ProxyCollector/blacklist.netset || true
+                  ProxyCollector/GeoLite2-Country.mmdb || true
 
           git fetch origin main
           git diff --cached --quiet && echo "Nothing staged" && exit 0
