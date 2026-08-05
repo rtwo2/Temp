@@ -417,23 +417,48 @@ namespace ProxyCollector.Collector
 
             LogInfo($"After smart dedup: {uniqueProxies.Count} unique ({cfFiltered} CDN filtered)");
 
-            // STEP 3: TCP alive check
-            LogInfo("🔌 TCP alive check (parallel)...");
-            var aliveBag = new ConcurrentBag<(ParsedProxy Proxy, int Latency)>();
+            // STEP 3: TCP alive check — two passes.
+            // Pass 1 finds candidates (same as before). Pass 2 re-probes only the survivors
+            // to confirm they're actually stable (not a one-off successful handshake) and
+            // gives an averaged, more trustworthy latency. Only re-probing the smaller
+            // survivor set keeps this cheap relative to pass 1.
+            LogInfo("🔌 TCP alive check — pass 1 (parallel)...");
+            var firstPassBag = new ConcurrentBag<(ParsedProxy Proxy, int Latency)>();
 
             await Parallel.ForEachAsync(uniqueProxies, new ParallelOptions { MaxDegreeOfParallelism = 200 },
                 async (p, _) =>
                 {
                     int lat = await TcpProbe(p.Host, p.Port);
-                    if (lat >= 0) aliveBag.Add((p, lat));
+                    if (lat >= 0) firstPassBag.Add((p, lat));
                 });
 
-            var alive = aliveBag
-                .OrderByDescending(x => x.Proxy.QualityScore)
+            var firstPass = firstPassBag.ToList();
+            LogSuccess($"Pass 1 alive: {firstPass.Count}");
+
+            LogInfo("🔌 TCP alive check — pass 2 (confirming stability)...");
+            var confirmedBag = new ConcurrentBag<(ParsedProxy Proxy, int Latency, bool Stable)>();
+
+            await Parallel.ForEachAsync(firstPass, new ParallelOptions { MaxDegreeOfParallelism = 200 },
+                async (item, _) =>
+                {
+                    int lat2 = await TcpProbe(item.Proxy.Host, item.Proxy.Port);
+                    if (lat2 >= 0)
+                        confirmedBag.Add((item.Proxy, (item.Latency + lat2) / 2, true));
+                    else
+                        confirmedBag.Add((item.Proxy, item.Latency, false)); // passed once, not stable — kept but ranked lower
+                });
+
+            // Real-performance ranking: stable nodes first, then fastest measured latency.
+            // QualityScore (protocol/TLS/port heuristics) is now only the final tiebreaker,
+            // so top1000 reflects nodes that actually connect fast and reliably.
+            var alive = confirmedBag
+                .OrderByDescending(x => x.Stable)
                 .ThenBy(x => x.Latency)
+                .ThenByDescending(x => x.Proxy.QualityScore)
+                .Select(x => (x.Proxy, x.Latency))
                 .ToList();
 
-            LogSuccess($"Alive proxies: {alive.Count}");
+            LogSuccess($"Alive proxies: {alive.Count} ({confirmedBag.Count(x => x.Stable)} stable)");
 
             // STEP 4: GeoIP warm + stable single-pass rename
             LogInfo("🌍 GeoIP lookup + rename...");
