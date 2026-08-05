@@ -244,59 +244,35 @@ namespace ProxyCollector.Collector
         }
 
         // ====================== LOCATION ======================
-        // Fallback chain: city-on-host -> country-on-host -> (if hostname) resolve DNS,
-        // then city-on-resolved-ip -> country-on-resolved-ip -> Unknown.
-        // Doing the city lookup on the resolved IP too (not just country, as before)
-        // means hostname-based nodes get the same city-level precision as IP-based ones.
-        private string GetLocation(string host)
+        // Resolves both the display string and the raw country code in one shot, so we
+        // never need a second DNS lookup for the same host later just to get its ISO code.
+        private async Task<(string Location, string CountryCode)> GetLocationAndCountryAsync(string host)
         {
             try
             {
-                string? result = TryCityThenCountry(host);
-                if (result != null) return result;
-
-                if (!IPAddress.TryParse(host, out _))
+                var city = await Resolver.GetCityAsync(host);
+                if (!string.IsNullOrEmpty(city?.CityName))
                 {
-                    try
-                    {
-                        var addrs = Dns.GetHostAddresses(host);
-                        foreach (var addr in addrs)
-                        {
-                            result = TryCityThenCountry(addr.ToString());
-                            if (result != null) return result;
-                        }
-                    }
-                    catch { }
+                    string cityCc = city.CountryCode?.ToUpper() ?? "XX";
+                    string flag = Flags.TryGetValue(cityCc, out var f) ? f : "🌍";
+                    string cityName = System.Globalization.CultureInfo.InvariantCulture.TextInfo
+                        .ToTitleCase(city.CityName.Trim().ToLowerInvariant());
+                    return ($"{flag} {cityName}, {cityCc}", cityCc);
                 }
 
-                return "🌐 Unknown";
-            }
-            catch { return "🌐 Unknown"; }
-        }
+                var country = await Resolver.GetCountryAsync(host);
+                string cc = country?.CountryCode?.ToUpper() ?? "XX";
+                if (!string.IsNullOrEmpty(cc) && cc != "XX")
+                {
+                    string flagC = Flags.TryGetValue(cc, out var fc) ? fc : "🌍";
+                    string name = !string.IsNullOrEmpty(country?.CountryName) && country.CountryName != "Unknown"
+                        ? country.CountryName : cc;
+                    return ($"{flagC} {name}", cc);
+                }
 
-        private string? TryCityThenCountry(string ipOrHost)
-        {
-            var city = Resolver.GetCity(ipOrHost);
-            if (!string.IsNullOrEmpty(city?.CityName))
-            {
-                string cityCc = city.CountryCode?.ToUpper() ?? "";
-                string flag = Flags.TryGetValue(cityCc, out var f) ? f : "🌍";
-                string cityName = System.Globalization.CultureInfo.InvariantCulture.TextInfo
-                    .ToTitleCase(city.CityName.Trim().ToLowerInvariant());
-                return $"{flag} {cityName}, {cityCc}";
+                return ("🌐 Unknown", "XX");
             }
-
-            var country = Resolver.GetCountry(ipOrHost);
-            string cc = country?.CountryCode?.ToUpper() ?? "";
-            if (!string.IsNullOrEmpty(cc) && cc != "XX")
-            {
-                string flagC = Flags.TryGetValue(cc, out var fc) ? fc : "🌍";
-                string name = !string.IsNullOrEmpty(country?.CountryName) && country.CountryName != "Unknown"
-                    ? country.CountryName : cc;
-                return $"{flagC} {name}";
-            }
-
-            return null;
+            catch { return ("🌐 Unknown", "XX"); }
         }
 
         private static string GetContinent(string cc)
@@ -460,28 +436,27 @@ namespace ProxyCollector.Collector
 
             LogSuccess($"Alive proxies: {alive.Count} ({confirmedBag.Count(x => x.Stable)} stable)");
 
-            // STEP 4: GeoIP warm + stable single-pass rename
+            // STEP 4: GeoIP + rename
             LogInfo("🌍 GeoIP lookup + rename...");
-            _ = Resolver;
 
             var uniqueHosts = alive.Select(x => x.Proxy.Host).Distinct().ToList();
-            LogInfo($"  Warming GeoIP cache for {uniqueHosts.Count} unique hosts...");
-            await Parallel.ForEachAsync(uniqueHosts, new ParallelOptions { MaxDegreeOfParallelism = 50 },
-                (host, _) => { try { GetLocation(host); } catch { } return ValueTask.CompletedTask; });
+            LogInfo($"  Resolving geo info for {uniqueHosts.Count} unique hosts...");
 
-            // ROOT-CAUSE FIX: cache location per host ONCE after warm-up.
-            // GetLocation() calls DNS which is non-deterministic between invocations —
-            // the same host can resolve to a different string on a second call if DNS
-            // times out or the GeoIP cache hits differently. Calling it in both Pass 1
-            // and Pass 2 meant the baseRemark key could differ, causing KeyNotFoundException.
-            // Now we call it exactly once per host and reuse the frozen result everywhere.
-            var locationCache = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-            foreach (var host in uniqueHosts)
-            {
-                try { locationCache[host] = GetLocation(host); }
-                catch { locationCache[host] = "🌐 Unknown"; }
-            }
+            // Single parallel pass — each host resolved exactly once, DNS bounded to 3s
+            // per lookup (see IPToCountryResolver), so a batch of dead hostnames costs
+            // at most a few minutes total instead of stalling one-by-one.
+            var locationCache = new ConcurrentDictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            var countryCache = new ConcurrentDictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            await Parallel.ForEachAsync(uniqueHosts, new ParallelOptions { MaxDegreeOfParallelism = 100 },
+                async (host, _) =>
+                {
+                    var (loc, cc) = await GetLocationAndCountryAsync(host);
+                    locationCache[host] = loc;
+                    countryCache[host] = cc;
+                });
+
             string Loc(string h) => locationCache.TryGetValue(h, out var l) ? l : "🌐 Unknown";
+            string Cc(string h) => countryCache.TryGetValue(h, out var c) ? c : "XX";
 
             var finalProxies = new List<FinalProxy>();
 
