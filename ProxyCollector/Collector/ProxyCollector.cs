@@ -29,11 +29,15 @@ namespace ProxyCollector.Collector
             "hysteria", "hysteria2", "hy2", "tuic", "socks5", "socks"
         };
 
-        // ====================== CLOUDFLARE / CDN CIDR FILTER ======================
-        // (String-prefix matching used to live here, e.g. "104.16." — but that also
-        //  matches 104.160.x.x-104.169.x.x, which is NOT Cloudflare. That false-positive
-        //  was quietly dropping a lot of legitimate nodes. Precise CIDR matching below
-        //  is now the only IP-range based filter.)
+        // ====================== HOST FILTER (EXACT/SUFFIX ONLY) ======================
+        // No IP-range/CDN filtering anymore. The previous Cloudflare CIDR filter blocked
+        // any host whose IP fell in Cloudflare's ranges — but fronting a proxy through
+        // Cloudflare (a bare Cloudflare IP, or a workers.dev/pages.dev endpoint) is a
+        // deliberate and common way to make a proxy reachable from a censored network.
+        // That filter was removing a large share of exactly the nodes most likely to work,
+        // which is why the node count stayed low even after FireHOL was removed. All that's
+        // left now is a short list of things that are never a real proxy server: bare public
+        // DNS resolver IPs, and dev-tunnel domains that don't host dedicated proxy configs.
         private static readonly HashSet<string> CdnIpExact = new()
         {
             "1.1.1.1", "1.0.0.1", "8.8.8.8", "8.8.4.4",
@@ -41,47 +45,8 @@ namespace ProxyCollector.Collector
 
         private static readonly HashSet<string> SuspiciousHostSuffixes = new(StringComparer.OrdinalIgnoreCase)
         {
-            "workers.dev", "pages.dev", "trycloudflare.com",
             "ngrok.io", "ngrok-free.app", "loca.lt", "serveo.net",
-            "cloudflare.com", "cloudflare.net",
         };
-
-        private static readonly (uint Network, uint Mask)[] CloudflareCidrs =
-        {
-            (IpToUint("103.21.244.0"),  CidrMask(22)),
-            (IpToUint("103.22.200.0"),  CidrMask(22)),
-            (IpToUint("103.31.4.0"),    CidrMask(22)),
-            (IpToUint("141.101.64.0"),  CidrMask(18)),
-            (IpToUint("108.162.192.0"), CidrMask(18)),
-            (IpToUint("190.93.240.0"),  CidrMask(20)),
-            (IpToUint("188.114.96.0"),  CidrMask(20)),
-            (IpToUint("197.234.240.0"), CidrMask(22)),
-            (IpToUint("198.41.128.0"),  CidrMask(17)),
-            (IpToUint("162.158.0.0"),   CidrMask(15)),
-            (IpToUint("104.16.0.0"),    CidrMask(13)),
-            (IpToUint("104.24.0.0"),    CidrMask(14)),
-            (IpToUint("172.64.0.0"),    CidrMask(13)),
-            (IpToUint("131.0.72.0"),    CidrMask(22)),
-        };
-
-        private static uint IpToUint(string ip)
-        {
-            var b = IPAddress.Parse(ip).GetAddressBytes();
-            return ((uint)b[0] << 24) | ((uint)b[1] << 16) | ((uint)b[2] << 8) | b[3];
-        }
-
-        private static uint CidrMask(int bits) => bits == 0 ? 0 : 0xFFFFFFFFu << (32 - bits);
-
-        private static bool IsCloudflareIp(string ipStr)
-        {
-            if (!IPAddress.TryParse(ipStr, out var ip)) return false;
-            if (ip.AddressFamily != System.Net.Sockets.AddressFamily.InterNetwork) return false;
-            var b = ip.GetAddressBytes();
-            uint addr = ((uint)b[0] << 24) | ((uint)b[1] << 16) | ((uint)b[2] << 8) | b[3];
-            foreach (var (net, mask) in CloudflareCidrs)
-                if ((addr & mask) == net) return true;
-            return false;
-        }
 
         private static readonly Dictionary<string, string> Flags = new(StringComparer.OrdinalIgnoreCase)
         {
@@ -224,6 +189,25 @@ namespace ProxyCollector.Collector
                 }
                 catch (Exception ex) { LogWarning($"Country DB failed: {ex.Message}"); }
             }
+
+            // ASN db is optional — org/hosting-provider name, used to fill in "more geo info"
+            // when a host has no city-level data (very common for VPS/hosting-provider IPs).
+            LogInfo("Downloading GeoLite2-ASN.mmdb...");
+            foreach (var url in new[]
+            {
+                "https://github.com/P3TERX/GeoLite.mmdb/raw/download/GeoLite2-ASN.mmdb",
+            })
+            {
+                try
+                {
+                    var resp = await http.GetAsync(url);
+                    resp.EnsureSuccessStatusCode();
+                    await using var fs = new FileStream("ProxyCollector/GeoLite2-ASN.mmdb", FileMode.Create);
+                    await resp.Content.CopyToAsync(fs);
+                    LogSuccess("GeoLite2-ASN.mmdb downloaded."); break;
+                }
+                catch (Exception ex) { LogWarning($"ASN DB failed (non-fatal, org names will be skipped): {ex.Message}"); }
+            }
         }
 
         // ====================== HOST FILTERING ======================
@@ -235,68 +219,57 @@ namespace ProxyCollector.Collector
             foreach (var s in SuspiciousHostSuffixes)
                 if (host.EndsWith(s, StringComparison.OrdinalIgnoreCase)) return true;
 
-            if (IPAddress.TryParse(host, out _))
-            {
-                if (IsCloudflareIp(host)) return true;
-            }
-
             return false;
         }
 
         // ====================== LOCATION ======================
-        // Fallback chain: city-on-host -> country-on-host -> (if hostname) resolve DNS,
-        // then city-on-resolved-ip -> country-on-resolved-ip -> Unknown.
-        // Doing the city lookup on the resolved IP too (not just country, as before)
-        // means hostname-based nodes get the same city-level precision as IP-based ones.
-        private string GetLocation(string host)
+        // Resolves both the display string and the raw country code in one shot, so we
+        // never need a second DNS lookup for the same host later just to get its ISO code.
+        // Fallback chain: city -> country + hosting-org name -> country only -> Unknown.
+        // The middle step matters a lot in practice: most proxy IPs are VPS/hosting-provider
+        // addresses that GeoLite2-City has no city entry for at all, so without the org name
+        // the result is just the bare country for the large majority of nodes.
+        private async Task<(string Location, string CountryCode)> GetLocationAndCountryAsync(string host)
         {
             try
             {
-                string? result = TryCityThenCountry(host);
-                if (result != null) return result;
-
-                if (!IPAddress.TryParse(host, out _))
+                var city = await Resolver.GetCityAsync(host);
+                if (!string.IsNullOrEmpty(city?.CityName))
                 {
-                    try
-                    {
-                        var addrs = Dns.GetHostAddresses(host);
-                        foreach (var addr in addrs)
-                        {
-                            result = TryCityThenCountry(addr.ToString());
-                            if (result != null) return result;
-                        }
-                    }
-                    catch { }
+                    string cityCc = city.CountryCode?.ToUpper() ?? "XX";
+                    string flag = Flags.TryGetValue(cityCc, out var f) ? f : "🌍";
+                    string cityName = System.Globalization.CultureInfo.InvariantCulture.TextInfo
+                        .ToTitleCase(city.CityName.Trim().ToLowerInvariant());
+                    return ($"{flag} {cityName}, {cityCc}", cityCc);
                 }
 
-                return "🌐 Unknown";
+                var country = await Resolver.GetCountryAsync(host);
+                string cc = country?.CountryCode?.ToUpper() ?? "XX";
+                if (!string.IsNullOrEmpty(cc) && cc != "XX")
+                {
+                    string flagC = Flags.TryGetValue(cc, out var fc) ? fc : "🌍";
+                    string name = !string.IsNullOrEmpty(country?.CountryName) && country.CountryName != "Unknown"
+                        ? country.CountryName : cc;
+
+                    string? org = await Resolver.GetOrgAsync(host);
+                    if (!string.IsNullOrEmpty(org))
+                        return ($"{flagC} {name} · {ShortenOrg(org)}", cc);
+
+                    return ($"{flagC} {name}", cc);
+                }
+
+                return ("🌐 Unknown", "XX");
             }
-            catch { return "🌐 Unknown"; }
+            catch { return ("🌐 Unknown", "XX"); }
         }
 
-        private string? TryCityThenCountry(string ipOrHost)
+        // MaxMind's org strings often carry legal suffixes ("Hetzner Online GmbH",
+        // "DigitalOcean, LLC") that add noise to a short remark — trim the common ones.
+        private static string ShortenOrg(string org)
         {
-            var city = Resolver.GetCity(ipOrHost);
-            if (!string.IsNullOrEmpty(city?.CityName))
-            {
-                string cityCc = city.CountryCode?.ToUpper() ?? "";
-                string flag = Flags.TryGetValue(cityCc, out var f) ? f : "🌍";
-                string cityName = System.Globalization.CultureInfo.InvariantCulture.TextInfo
-                    .ToTitleCase(city.CityName.Trim().ToLowerInvariant());
-                return $"{flag} {cityName}, {cityCc}";
-            }
-
-            var country = Resolver.GetCountry(ipOrHost);
-            string cc = country?.CountryCode?.ToUpper() ?? "";
-            if (!string.IsNullOrEmpty(cc) && cc != "XX")
-            {
-                string flagC = Flags.TryGetValue(cc, out var fc) ? fc : "🌍";
-                string name = !string.IsNullOrEmpty(country?.CountryName) && country.CountryName != "Unknown"
-                    ? country.CountryName : cc;
-                return $"{flagC} {name}";
-            }
-
-            return null;
+            org = Regex.Replace(org, @",?\s*(LLC|Inc\.?|GmbH|S\.A\.?|Ltd\.?|Co\.?|Corp\.?|SAS|B\.V\.?)\.?$",
+                "", RegexOptions.IgnoreCase).Trim();
+            return org.Length > 24 ? org[..24].TrimEnd() : org;
         }
 
         private static string GetContinent(string cc)
@@ -417,93 +390,63 @@ namespace ProxyCollector.Collector
 
             LogInfo($"After smart dedup: {uniqueProxies.Count} unique ({cfFiltered} CDN filtered)");
 
-            // STEP 3: TCP alive check — two passes.
-            // Pass 1 finds candidates (same as before). Pass 2 re-probes only the survivors
-            // to confirm they're actually stable (not a one-off successful handshake) and
-            // gives an averaged, more trustworthy latency. Only re-probing the smaller
-            // survivor set keeps this cheap relative to pass 1.
-            LogInfo("🔌 TCP alive check — pass 1 (parallel)...");
-            var firstPassBag = new ConcurrentBag<(ParsedProxy Proxy, int Latency)>();
+            // STEP 3: TCP alive check — single pass, just "does the port open".
+            // No second confirmation pass and no latency/quality ranking — there's no
+            // top-N output anymore to rank for, so this is just a plain reachability filter.
+            LogInfo("🔌 TCP alive check (parallel)...");
+            var aliveBag = new ConcurrentBag<ParsedProxy>();
 
             await Parallel.ForEachAsync(uniqueProxies, new ParallelOptions { MaxDegreeOfParallelism = 200 },
                 async (p, _) =>
                 {
-                    int lat = await TcpProbe(p.Host, p.Port);
-                    if (lat >= 0) firstPassBag.Add((p, lat));
+                    if (await TcpProbe(p.Host, p.Port) >= 0) aliveBag.Add(p);
                 });
 
-            var firstPass = firstPassBag.ToList();
-            LogSuccess($"Pass 1 alive: {firstPass.Count}");
+            var alive = aliveBag.ToList();
+            LogSuccess($"Alive proxies: {alive.Count}");
 
-            LogInfo("🔌 TCP alive check — pass 2 (confirming stability)...");
-            var confirmedBag = new ConcurrentBag<(ParsedProxy Proxy, int Latency, bool Stable)>();
-
-            await Parallel.ForEachAsync(firstPass, new ParallelOptions { MaxDegreeOfParallelism = 200 },
-                async (item, _) =>
-                {
-                    int lat2 = await TcpProbe(item.Proxy.Host, item.Proxy.Port);
-                    if (lat2 >= 0)
-                        confirmedBag.Add((item.Proxy, (item.Latency + lat2) / 2, true));
-                    else
-                        confirmedBag.Add((item.Proxy, item.Latency, false)); // passed once, not stable — kept but ranked lower
-                });
-
-            // Real-performance ranking: stable nodes first, then fastest measured latency.
-            // QualityScore (protocol/TLS/port heuristics) is now only the final tiebreaker,
-            // so top1000 reflects nodes that actually connect fast and reliably.
-            var alive = confirmedBag
-                .OrderByDescending(x => x.Stable)
-                .ThenBy(x => x.Latency)
-                .ThenByDescending(x => x.Proxy.QualityScore)
-                .Select(x => (x.Proxy, x.Latency))
-                .ToList();
-
-            LogSuccess($"Alive proxies: {alive.Count} ({confirmedBag.Count(x => x.Stable)} stable)");
-
-            // STEP 4: GeoIP warm + stable single-pass rename
+            // STEP 4: GeoIP + rename
             LogInfo("🌍 GeoIP lookup + rename...");
-            _ = Resolver;
 
-            var uniqueHosts = alive.Select(x => x.Proxy.Host).Distinct().ToList();
-            LogInfo($"  Warming GeoIP cache for {uniqueHosts.Count} unique hosts...");
-            await Parallel.ForEachAsync(uniqueHosts, new ParallelOptions { MaxDegreeOfParallelism = 50 },
-                (host, _) => { try { GetLocation(host); } catch { } return ValueTask.CompletedTask; });
+            var uniqueHosts = alive.Select(x => x.Host).Distinct().ToList();
+            LogInfo($"  Resolving geo info for {uniqueHosts.Count} unique hosts...");
 
-            // ROOT-CAUSE FIX: cache location per host ONCE after warm-up.
-            // GetLocation() calls DNS which is non-deterministic between invocations —
-            // the same host can resolve to a different string on a second call if DNS
-            // times out or the GeoIP cache hits differently. Calling it in both Pass 1
-            // and Pass 2 meant the baseRemark key could differ, causing KeyNotFoundException.
-            // Now we call it exactly once per host and reuse the frozen result everywhere.
-            var locationCache = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-            foreach (var host in uniqueHosts)
-            {
-                try { locationCache[host] = GetLocation(host); }
-                catch { locationCache[host] = "🌐 Unknown"; }
-            }
+            // Single parallel pass — each host resolved exactly once, DNS bounded to 3s
+            // per lookup (see IPToCountryResolver), so a batch of dead hostnames costs
+            // at most a few minutes total instead of stalling one-by-one.
+            var locationCache = new ConcurrentDictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            var countryCache = new ConcurrentDictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            await Parallel.ForEachAsync(uniqueHosts, new ParallelOptions { MaxDegreeOfParallelism = 100 },
+                async (host, _) =>
+                {
+                    var (loc, cc) = await GetLocationAndCountryAsync(host);
+                    locationCache[host] = loc;
+                    countryCache[host] = cc;
+                });
+
             string Loc(string h) => locationCache.TryGetValue(h, out var l) ? l : "🌐 Unknown";
+            string Cc(string h) => countryCache.TryGetValue(h, out var c) ? c : "XX";
 
             var finalProxies = new List<FinalProxy>();
 
-            // Pass 1: count total occurrences of each base remark using frozen locations
-            // NOTE: remark no longer contains the server address/port — just geo + protocol —
-            // so uniqueness is purely location+protocol based now.
+            // Pass 1: count total occurrences of each base remark using frozen locations.
+            // Remark is now geo + host address only — no port, no protocol — so two nodes
+            // on the same host with different ports/protocols will collide here and get a
+            // counter suffix, same as any other duplicate.
             var remarkTotal = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
-            foreach (var item in alive)
+            foreach (var p in alive)
             {
-                var p = item.Proxy;
-                string baseRemark = $"{Loc(p.Host)} | {NormalizeProto(p.Protocol).ToUpperInvariant()}";
+                string baseRemark = $"{Loc(p.Host)} | {p.Host}";
                 remarkTotal.TryGetValue(baseRemark, out int cnt);
                 remarkTotal[baseRemark] = cnt + 1;
             }
 
             // Pass 2: assign remarks — unique nodes get no suffix, duplicates get #1, #2, #3...
             var remarkCounter = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
-            foreach (var item in alive)
+            foreach (var p in alive)
             {
-                var p = item.Proxy;
                 string proto = NormalizeProto(p.Protocol);
-                string baseRemark = $"{Loc(p.Host)} | {proto.ToUpperInvariant()}";
+                string baseRemark = $"{Loc(p.Host)} | {p.Host}";
 
                 remarkCounter.TryGetValue(baseRemark, out int current);
                 remarkCounter[baseRemark] = current + 1;
@@ -516,14 +459,14 @@ namespace ProxyCollector.Collector
                     : $"{baseRemark} #{current + 1}";
 
                 string cleanLink = BuildCleanLink(p, remark);
-                string cc = Resolver.GetCountry(p.Host)?.CountryCode?.ToUpper() ?? "XX";
+                string cc = Cc(p.Host);
                 string continent = GetContinent(cc);
 
                 finalProxies.Add(new FinalProxy
                 {
                     Link = cleanLink, Proto = proto, CountryCode = cc,
                     Continent = continent, Remark = remark,
-                    Latency = item.Latency, QualityScore = p.QualityScore
+                    QualityScore = p.QualityScore
                 });
             }
 
@@ -646,10 +589,9 @@ namespace ProxyCollector.Collector
         }
 
         // ====================== SAVE OUTPUTS ======================
-        // Raw output only (no yaml/json) — every category gets two files:
-        //   <name>.txt          full list
-        //   <name>.top1000.txt  best 1000 nodes (already quality+latency sorted upstream)
-        private const int TopCap = 1000;
+        // Raw output only — <name>.txt always holds the first 500 lines (this filename
+        // never changes), overflow beyond that goes to <name>_part2.txt, _part3.txt, ...
+        private const int ChunkSize = 500;
 
         private async Task SaveAllCategories(List<FinalProxy> proxies)
         {
@@ -658,7 +600,7 @@ namespace ProxyCollector.Collector
                 Directory.CreateDirectory(Path.Combine(sub, d));
 
             await WriteTxt(Path.Combine(sub, "everything"), proxies);
-            LogSuccess($"Saved everything.txt / everything.top1000.txt ({proxies.Count})");
+            LogSuccess($"Saved everything ({proxies.Count})");
 
             foreach (var g in proxies.GroupBy(x => x.Proto))
             {
@@ -686,15 +628,24 @@ namespace ProxyCollector.Collector
             }
         }
 
-        // ====================== WRITE TXT (+ TOP1000) ======================
+        // ====================== WRITE TXT (chunked) ======================
+        // First 500 lines always go to <name>.txt — that filename never changes, so a
+        // subscription link to it stays valid regardless of node count. Any overflow
+        // beyond that goes to <name>_part2.txt, _part3.txt, ... (numbering starts at 2,
+        // not 1, precisely so xx_part1.txt never exists and can't be confused with xx.txt).
         private static async Task WriteTxt(string pathNoExt, List<FinalProxy> proxies)
         {
-            // Full plain-text URI list
-            await File.WriteAllLinesAsync(pathNoExt + ".txt", proxies.Select(x => x.Link));
+            await File.WriteAllLinesAsync(pathNoExt + ".txt", proxies.Take(ChunkSize).Select(x => x.Link));
 
-            // Best 1000 only — proxies is already ordered by QualityScore desc, then latency asc
-            var top = proxies.Count > TopCap ? proxies.Take(TopCap) : proxies;
-            await File.WriteAllLinesAsync(pathNoExt + ".top1000.txt", top.Select(x => x.Link));
+            if (proxies.Count <= ChunkSize) return;
+
+            int partNum = 2;
+            for (int i = ChunkSize; i < proxies.Count; i += ChunkSize)
+            {
+                var chunk = proxies.Skip(i).Take(ChunkSize).Select(x => x.Link);
+                await File.WriteAllLinesAsync($"{pathNoExt}_part{partNum}.txt", chunk);
+                partNum++;
+            }
         }
 
         // ====================== PARSE ======================
@@ -741,6 +692,9 @@ namespace ProxyCollector.Collector
                 catch { return null; }
             }
 
+            if (baseLink.StartsWith("ss://", StringComparison.OrdinalIgnoreCase))
+                return ParseShadowsocksLink(baseLink);
+
             try
             {
                 var uri = new Uri(baseLink);
@@ -769,6 +723,97 @@ namespace ProxyCollector.Collector
                     Sni        = sni,
                     Path       = path,
                     BaseLink   = baseLink
+                };
+            }
+            catch { return null; }
+        }
+
+        // Handles both real-world ss:// forms:
+        //   SIP002 mixed:  ss://BASE64(method:password)@host:port?params#remark
+        //   Legacy:        ss://BASE64(method:password@host:port)#remark
+        private static ParsedProxy? ParseShadowsocksLink(string baseLink)
+        {
+            try
+            {
+                string rest = baseLink["ss://".Length..];
+                int atIdx = rest.IndexOf('@');
+
+                if (atIdx > 0)
+                {
+                    // SIP002 mixed form
+                    string userPart = rest[..atIdx];
+                    string hostPart = rest[(atIdx + 1)..];
+
+                    string method = "", password = "";
+                    try
+                    {
+                        string b64 = userPart;
+                        int pad = b64.Length % 4; if (pad > 0) b64 += new string('=', 4 - pad);
+                        string decoded = Encoding.UTF8.GetString(Convert.FromBase64String(b64));
+                        int c = decoded.IndexOf(':');
+                        if (c > 0) { method = decoded[..c]; password = decoded[(c + 1)..]; }
+                    }
+                    catch
+                    {
+                        // SIP002 also allows a cleartext "method:password" here
+                        int c = userPart.IndexOf(':');
+                        if (c > 0)
+                        {
+                            method = Uri.UnescapeDataString(userPart[..c]);
+                            password = Uri.UnescapeDataString(userPart[(c + 1)..]);
+                        }
+                    }
+
+                    if (string.IsNullOrEmpty(method)) return null;
+
+                    int qIdx = hostPart.IndexOf('?');
+                    string hostPort = qIdx >= 0 ? hostPart[..qIdx] : hostPart;
+                    string query = qIdx >= 0 ? hostPart[(qIdx + 1)..] : "";
+
+                    int colonIdx = hostPort.LastIndexOf(':');
+                    if (colonIdx <= 0) return null;
+                    string host = hostPort[..colonIdx];
+                    string port = hostPort[(colonIdx + 1)..];
+                    if (string.IsNullOrEmpty(host) || host == "0.0.0.0") return null;
+
+                    var q = ParseQuery(query);
+                    return new ParsedProxy
+                    {
+                        Protocol = "ss", Host = host, Port = port,
+                        Credential = $"{method}:{password}",
+                        Network = "tcp", Security = "",
+                        Sni = q.GetValueOrDefault("host", ""), Path = "",
+                        BaseLink = baseLink
+                    };
+                }
+
+                // Fully-encoded legacy form
+                string legacyB64 = rest;
+                int legacyPad = legacyB64.Length % 4; if (legacyPad > 0) legacyB64 += new string('=', 4 - legacyPad);
+                string legacyDecoded = Encoding.UTF8.GetString(Convert.FromBase64String(legacyB64));
+
+                int atIdx2 = legacyDecoded.LastIndexOf('@');
+                if (atIdx2 <= 0) return null;
+                string userPart2 = legacyDecoded[..atIdx2];
+                string hostPort2 = legacyDecoded[(atIdx2 + 1)..];
+
+                int c2 = userPart2.IndexOf(':');
+                if (c2 <= 0) return null;
+                string method2 = userPart2[..c2];
+                string password2 = userPart2[(c2 + 1)..];
+
+                int colonIdx2 = hostPort2.LastIndexOf(':');
+                if (colonIdx2 <= 0) return null;
+                string host2 = hostPort2[..colonIdx2];
+                string port2 = hostPort2[(colonIdx2 + 1)..];
+                if (string.IsNullOrEmpty(host2) || host2 == "0.0.0.0") return null;
+
+                return new ParsedProxy
+                {
+                    Protocol = "ss", Host = host2, Port = port2,
+                    Credential = $"{method2}:{password2}",
+                    Network = "tcp", Security = "", Sni = "", Path = "",
+                    BaseLink = baseLink
                 };
             }
             catch { return null; }
@@ -832,7 +877,6 @@ namespace ProxyCollector.Collector
         public string  CountryCode      { get; set; } = "XX";
         public string  Continent        { get; set; } = "Unknown";
         public string  Remark           { get; set; } = "";
-        public int     Latency          { get; set; }
         public int     QualityScore     { get; set; }
     }
 }
