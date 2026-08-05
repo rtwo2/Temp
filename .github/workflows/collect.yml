@@ -233,8 +233,7 @@ jobs:
           git config --global user.name "GitHub Actions"
           git config --global user.email "actions@github.com"
 
-          git add sub/everything.txt \
-                  sub/everything.top1000.txt \
+          git add sub/everything*.txt \
                   sub/protocols/ \
                   sub/countries/ \
                   sub/continents/ \
@@ -243,7 +242,7 @@ jobs:
           git fetch origin main
           git diff --cached --quiet && echo "Nothing staged" && exit 0
 
-          PROXY_COUNT=$(wc -l < sub/everything.txt 2>/dev/null || echo 0)
+          PROXY_COUNT=$(cat sub/everything*.txt 2>/dev/null | wc -l || echo 0)
           git commit -m "Fresh proxies - $(date +'%Y-%m-%d %H:%M UTC') - ${PROXY_COUNT} proxies" || echo "Nothing to commit"
 
           git push origin HEAD:main --force-with-lease || git push origin HEAD:main --force || echo "Push failed"
