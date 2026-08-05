@@ -2,6 +2,7 @@ using System;
 using System.Collections.Concurrent;
 using System.IO;
 using System.Net;
+using System.Threading.Tasks;
 using MaxMind.GeoIP2;
 using ProxyCollector.Models;
 
@@ -11,8 +12,10 @@ public sealed class IPToCountryResolver : IDisposable
 {
     private readonly DatabaseReader? _countryReader;
     private readonly DatabaseReader? _cityReader;
+    private readonly DatabaseReader? _asnReader;
     private readonly ConcurrentDictionary<string, CountryInfo> _countryCache = new();
     private readonly ConcurrentDictionary<string, CityInfo> _cityCache = new();
+    private readonly ConcurrentDictionary<string, string> _orgCache = new();
     private bool _disposed;
 
     public IPToCountryResolver()
@@ -40,20 +43,39 @@ public sealed class IPToCountryResolver : IDisposable
             }
             catch (Exception ex) { Console.WriteLine($"[WARN] Country DB load failed: {ex.Message}"); }
         }
+
+        // ASN Database (Optional — org/hosting-provider name, used when city data is missing.
+        // Most proxy IPs are VPS/hosting-provider IPs, which GeoLite2-City frequently has no
+        // city entry for at all — the org name is often the only extra info available for them.)
+        var asnPath = Path.Combine(Directory.GetCurrentDirectory(), "ProxyCollector", "GeoLite2-ASN.mmdb");
+        if (File.Exists(asnPath))
+        {
+            try
+            {
+                _asnReader = new DatabaseReader(asnPath);
+                Console.WriteLine($"[INFO] Loaded GeoLite2-ASN.mmdb");
+            }
+            catch (Exception ex) { Console.WriteLine($"[WARN] ASN DB load failed: {ex.Message}"); }
+        }
     }
 
-    public CityInfo GetCity(string address)
+    public async Task<CityInfo> GetCityAsync(string address)
     {
         if (_cityReader == null)
-            return GetCountryFallback(address);
+            return await GetCountryFallbackAsync(address);
 
         if (_cityCache.TryGetValue(address, out var cached))
             return cached;
 
         try
         {
-            var ip = ResolveIp(address);
-            if (ip == null) return GetCountryFallback(address);
+            var ip = await ResolveIpAsync(address);
+            if (ip == null)
+            {
+                var fb = await GetCountryFallbackAsync(address);
+                _cityCache[address] = fb; // negative-cache so we don't re-resolve DNS every call
+                return fb;
+            }
 
             var response = _cityReader.City(ip);
             var cityInfo = new CityInfo
@@ -69,11 +91,13 @@ public sealed class IPToCountryResolver : IDisposable
         }
         catch
         {
-            return GetCountryFallback(address);
+            var fb = await GetCountryFallbackAsync(address);
+            _cityCache[address] = fb;
+            return fb;
         }
     }
 
-    public CountryInfo GetCountry(string address)
+    public async Task<CountryInfo> GetCountryAsync(string address)
     {
         if (_countryReader == null)
             return new CountryInfo { CountryCode = "XX", CountryName = "Unknown" };
@@ -83,7 +107,7 @@ public sealed class IPToCountryResolver : IDisposable
 
         try
         {
-            var ip = ResolveIp(address);
+            var ip = await ResolveIpAsync(address);
             if (ip == null)
             {
                 var xx = new CountryInfo { CountryCode = "XX", CountryName = "Unknown" };
@@ -110,9 +134,34 @@ public sealed class IPToCountryResolver : IDisposable
         }
     }
 
-    private CityInfo GetCountryFallback(string address)
+    public async Task<string?> GetOrgAsync(string address)
     {
-        var country = GetCountry(address);
+        if (_asnReader == null) return null;
+
+        if (_orgCache.TryGetValue(address, out var cached))
+            return string.IsNullOrEmpty(cached) ? null : cached;
+
+        try
+        {
+            var ip = await ResolveIpAsync(address);
+            if (ip == null) { _orgCache[address] = ""; return null; }
+
+            var response = _asnReader.Asn(ip);
+            string org = response.AutonomousSystemOrganization ?? "";
+            _orgCache[address] = org;
+            _orgCache[ip.ToString()] = org;
+            return string.IsNullOrEmpty(org) ? null : org;
+        }
+        catch
+        {
+            _orgCache[address] = "";
+            return null;
+        }
+    }
+
+    private async Task<CityInfo> GetCountryFallbackAsync(string address)
+    {
+        var country = await GetCountryAsync(address);
         return new CityInfo
         {
             CountryCode = country.CountryCode,
@@ -121,13 +170,23 @@ public sealed class IPToCountryResolver : IDisposable
         };
     }
 
-    private IPAddress? ResolveIp(string address)
+    // DNS.GetHostAddresses (sync) has no timeout and can block for a long time on a
+    // hostname that doesn't resolve — the OS resolver's own default can run well past
+    // what's reasonable here, and with hundreds of dead hostnames in a batch those
+    // stalls add up to minutes of dead time. Bound every lookup to a hard 3s.
+    private static readonly TimeSpan DnsTimeout = TimeSpan.FromSeconds(3);
+
+    private static async Task<IPAddress?> ResolveIpAsync(string address)
     {
         if (IPAddress.TryParse(address, out var ip)) return ip;
 
         try
         {
-            var addresses = Dns.GetHostAddresses(address);
+            var dnsTask = Dns.GetHostAddressesAsync(address);
+            var winner = await Task.WhenAny(dnsTask, Task.Delay(DnsTimeout));
+            if (winner != dnsTask) return null; // timed out
+
+            var addresses = await dnsTask;
             return addresses.Length > 0 ? addresses[0] : null;
         }
         catch
@@ -142,6 +201,7 @@ public sealed class IPToCountryResolver : IDisposable
         {
             _cityReader?.Dispose();
             _countryReader?.Dispose();
+            _asnReader?.Dispose();
             _disposed = true;
         }
     }
