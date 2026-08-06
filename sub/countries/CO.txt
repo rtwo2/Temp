@@ -1,6 +1,10 @@
-vless://8fb65472-5957-4f64-ba2d-b5812b2f155a@149.130.176.140:62145?encryption=none&amp;security=none&amp;type=tcp#%F0%9F%87%A8%F0%9F%87%B4%20Cota%2C%20CO%20%7C%20149.130.176.140%20%231
+vless://8fb65472-5957-4f64-ba2d-b5812b2f155a@149.130.188.238:62145?security=none&type=tcp&packetEncoding=none#%F0%9F%87%A8%F0%9F%87%B4%20Cota%2C%20CO%20%7C%20149.130.188.238%20%231
+vless://8fb65472-5957-4f64-ba2d-b5812b2f155a@149.130.160.234:62145?&type=tcp&headerType=none&path=%2F#%F0%9F%87%A8%F0%9F%87%B4%20Cota%2C%20CO%20%7C%20149.130.160.234
+vless://8fb65472-5957-4f64-ba2d-b5812b2f155a@149.130.186.161:62145?security=none&type=tcp&packetEncoding=xudp#%F0%9F%87%A8%F0%9F%87%B4%20Cota%2C%20CO%20%7C%20149.130.186.161
+vless://8fb65472-5957-4f64-ba2d-b5812b2f155a@149.130.176.140:62145?encryption=none&security=none&type=tcp#%F0%9F%87%A8%F0%9F%87%B4%20Cota%2C%20CO%20%7C%20149.130.176.140%20%231
 vless://8fb65472-5957-4f64-ba2d-b5812b2f155a@149.130.186.27:62145?encryption=none&type=raw&headerType=none&security=none#%F0%9F%87%A8%F0%9F%87%B4%20Cota%2C%20CO%20%7C%20149.130.186.27%20%231
-vless://8fb65472-5957-4f64-ba2d-b5812b2f155a@149.130.176.140:62145?encryption=none&security=none&type=tcp#%F0%9F%87%A8%F0%9F%87%B4%20Cota%2C%20CO%20%7C%20149.130.176.140%20%232
-vless://8fb65472-5957-4f64-ba2d-b5812b2f155a@149.130.186.27:62145?&type=tcp&headerType=none&path=/#%F0%9F%87%A8%F0%9F%87%B4%20Cota%2C%20CO%20%7C%20149.130.186.27%20%232
-vless://8fb65472-5957-4f64-ba2d-b5812b2f155a@149.130.186.27:62145?type=tcp&headerType=none&encryption=none&security=none#%F0%9F%87%A8%F0%9F%87%B4%20Cota%2C%20CO%20%7C%20149.130.186.27%20%233
+vless://8fb65472-5957-4f64-ba2d-b5812b2f155a@149.130.176.140:62145?#%F0%9F%87%A8%F0%9F%87%B4%20Cota%2C%20CO%20%7C%20149.130.176.140%20%232
+vless://8fb65472-5957-4f64-ba2d-b5812b2f155a@149.130.186.27:62145?security=none&amp;type=tcp&amp;headerType=none&amp;encryption=none#%F0%9F%87%A8%F0%9F%87%B4%20Cota%2C%20CO%20%7C%20149.130.186.27%20%232
+vless://8fb65472-5957-4f64-ba2d-b5812b2f155a@149.130.188.238:62145?&type=tcp&headerType=none&path=%2F#%F0%9F%87%A8%F0%9F%87%B4%20Cota%2C%20CO%20%7C%20149.130.188.238%20%232
+vless://8fb65472-5957-4f64-ba2d-b5812b2f155a@149.130.186.27:62145?&type=tcp&headerType=none&path=%2F#%F0%9F%87%A8%F0%9F%87%B4%20Cota%2C%20CO%20%7C%20149.130.186.27%20%233
 vless://394f6981-a782-4779-9a85-e6cf22935d93@169.150.228.24:8443?encryption=none&security=tls&sni=bog-co-01.fromblancwithlove.com&insecure=0&allowInsecure=0&type=tcp&headerType=none#%F0%9F%87%A8%F0%9F%87%B4%20Bogot%C3%A1%2C%20CO%20%7C%20169.150.228.24
